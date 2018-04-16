@@ -38,9 +38,6 @@ namespace AlertPacketCapture
             data = JsonConvert.DeserializeObject<Webhook>(requestBody);
             var alertResource = data.RequestBody.context;
 
-            //Authentication
-            var azureServiceTokenProvider = new AzureServiceTokenProvider();
-            string accessToken = await azureServiceTokenProvider.GetAccessTokenAsync("https://management.azure.com/");
 
             var config = new ConfigurationBuilder()
                 .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
