@@ -1,22 +1,14 @@
 using System.IO;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Newtonsoft.Json;
-using Microsoft.Azure.Services.AppAuthentication;
 using System.Threading.Tasks;
-
 using Microsoft.Azure.Management.Compute.Fluent;
-using Microsoft.Azure.Management.Compute.Fluent.Models;
 using Microsoft.Azure.Management.Fluent;
-using Microsoft.Azure.Management.Network.Fluent.Models;
 using Microsoft.Azure.Management.ResourceManager.Fluent;
 using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
-using Microsoft.Rest;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Authentication;
-using System.Collections;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Azure.Management.Network.Fluent;
 using System.Collections.Generic;
@@ -38,7 +30,6 @@ namespace AlertPacketCapture
             data = JsonConvert.DeserializeObject<Webhook>(requestBody);
             var alertResource = data.RequestBody.context;
 
-
             var config = new ConfigurationBuilder()
                 .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
                 .AddEnvironmentVariables()
@@ -47,6 +38,12 @@ namespace AlertPacketCapture
             string clientId = config.GetConnectionString("clientId");
             string tenantId = config.GetConnectionString("TenantId");
             string clientKey = config.GetConnectionString("ClientKey");
+
+            if (tenantId == null || clientId == null || clientKey == null)
+            {
+                log.Error("Serivice credentials are null. Check connection string settings");
+                return;
+            }
 
             var credentials = SdkContext.AzureCredentialsFactory
                 .FromServicePrincipal(clientId,
@@ -83,6 +80,7 @@ namespace AlertPacketCapture
                     .WithType("NetworkWatcherAgentWindows")
                     .WithVersion("1.4")
                     .Attach();
+                log.Info("Installed Extension on " + VM.Name);
             }
 
             //Retrieve appropriate Network Watcher, or create one. 
