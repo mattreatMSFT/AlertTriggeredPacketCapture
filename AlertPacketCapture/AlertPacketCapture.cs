@@ -6,6 +6,7 @@ using Microsoft.Azure.WebJobs.Host;
 using Newtonsoft.Json;
 using System.Threading.Tasks;
 using Microsoft.Azure.Management.Compute.Fluent;
+using Microsoft.Azure.Management.ResourceManager.Fluent.Authentication;
 using Microsoft.Azure.Management.Fluent;
 using Microsoft.Azure.Management.ResourceManager.Fluent;
 using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
@@ -19,104 +20,55 @@ namespace AlertPacketCapture
 {
     public static class AlertPacketCapture
     {
-
-        [FunctionName("Function1")]
+        [FunctionName("AlertPacketCapture")]
         public static async Task Run([HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = null)]HttpRequest req, TraceWriter log)
         {
             log.Info("C# HTTP trigger function processed a request.");
+
             //Parse alert request
             string requestBody = new StreamReader(req.Body).ReadToEnd();
             Webhook data = new Webhook();
             data = JsonConvert.DeserializeObject<Webhook>(requestBody);
-            var alertResource = data.RequestBody.context;
+            Context alertResource = data.RequestBody.context;
 
-            var config = new ConfigurationBuilder()
+            IConfigurationRoot config = new ConfigurationBuilder()
                 .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
                 .AddEnvironmentVariables()
                 .Build();
 
-            string clientId = config.GetConnectionString("clientId");
             string tenantId = config.GetConnectionString("TenantId");
+            string clientId = config.GetConnectionString("clientId");
             string clientKey = config.GetConnectionString("ClientKey");
-
-            if (tenantId == null || clientId == null || clientKey == null)
+            if (string.IsNullOrEmpty(tenantId) || string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(clientKey))
             {
                 log.Error("Serivice credentials are null. Check connection string settings");
                 return;
             }
 
-            var credentials = SdkContext.AzureCredentialsFactory
-                .FromServicePrincipal(clientId,
-                clientKey,
-                tenantId,
-                AzureEnvironment.AzureGlobalCloud);
-            var azure = Azure
-                .Configure()
-                .Authenticate(credentials)
-                .WithSubscription(alertResource.subscriptionId);
-            //end authentication
-
+            AzureCredentials credentials = SdkContext.AzureCredentialsFactory.FromServicePrincipal(clientId, clientKey, tenantId, AzureEnvironment.AzureGlobalCloud);
+            IAzure azure = Azure.Configure().Authenticate(credentials).WithSubscription(alertResource.subscriptionId);
             if (azure == null)
             {
-                log.Error("Error: Issues logging into Azure subscription: " + alertResource.subscriptionId + " Exiting");
+                log.Error("Error: Issues logging into Azure subscription: " + alertResource.subscriptionId + ". Exiting.");
                 return;
             }
 
             IVirtualMachine VM = await azure.VirtualMachines.GetByIdAsync(alertResource.resourceId);
             if (VM == null)
             {
-                log.Error("Error: VM: " + alertResource.resourceId + "was not found Exiting");
+                log.Error("Error: VM: " + alertResource.resourceId + "was not found. Exiting.");
                 return;
             }
 
+            INetworkWatcher networkWatcher = await EnsureNetworkWatcherExists(azure, VM.Region, log);
 
-            //Check if VM has extension. Install if not.
-            IVirtualMachineExtension extension = VM.ListExtensions().First(x => x.Value.PublisherName == "Microsoft.Azure.NetworkWatcher").Value;
-            if (extension == null)
-            {
-                VM.Update()
-                    .DefineNewExtension("packetcapture")
-                    .WithPublisher("Microsoft.Azure.NetworkWatcher")
-                    .WithType("NetworkWatcherAgentWindows")
-                    .WithVersion("1.4")
-                    .Attach();
-                log.Info("Installed Extension on " + VM.Name);
-            }
+            InstallNetworkWatcherExtension(VM, log);
 
-            //Retrieve appropriate Network Watcher, or create one. 
-            INetworkWatcher networkWatcher = azure.NetworkWatchers.List().First(x => x.Region == VM.Region);
-            if (networkWatcher == null)
-            {
-                try
-                {
-                    //Create Resource Group for Network Watcher if it does not exist. 
-                    IResourceGroup networkWatcherRG = azure.ResourceGroups.GetByName("NetworkWatcherRG");
-                    if (networkWatcherRG == null)
-                    {
-                        networkWatcherRG = await azure.ResourceGroups
-                            .Define("NetworkWatcherRG")
-                            .WithRegion(Region.USWestCentral)
-                            .CreateAsync();
-                    }
-                    string networkWatcherName = "NetworkWatcher_" + VM.Region.Name.ToString();
-
-                    networkWatcher = await azure.NetworkWatchers.Define(networkWatcherName)
-                    .WithRegion(VM.Region)
-                    .WithExistingResourceGroup(networkWatcherRG)
-                    .CreateAsync();
-                }
-                catch
-                {
-                    log.Error("Unable to create ResourceGroup or Network Watcher. Exiting.");
-                    return;
-                }
-            }
             string storageAccountId = Environment.GetEnvironmentVariable("PacketCaptureStorageAccount");
-
             var storageAccount = await azure.StorageAccounts.GetByIdAsync(storageAccountId);
             if (storageAccount == null)
             {
-                log.Error("Storage Account: " + storageAccountId + " not found. Exiting");
+                log.Error("Storage Account: " + storageAccountId + " not found. Exiting.");
                 return;
             }
 
@@ -151,6 +103,54 @@ namespace AlertPacketCapture
                 .WithTimeLimitInSeconds(15)
                 .CreateAsync();
             log.Info("Packet Capture created successfully");
+        }
+
+        private static async Task<INetworkWatcher> EnsureNetworkWatcherExists(IAzure azure, Region region, TraceWriter log = null)
+        {
+            // Retrieve appropriate Network Watcher, or create one
+            INetworkWatcher networkWatcher = azure.NetworkWatchers.List().First(x => x.Region == region);
+            if (networkWatcher == null)
+            {
+                try
+                {
+                    // Create Resource Group for Network Watcher if Network Watcher does not exist
+                    IResourceGroup networkWatcherRG = azure.ResourceGroups.GetByName("NetworkWatcherRG");
+                    if (networkWatcherRG == null)
+                    {
+                        // The RG is conventionally created in USWestCentral even though the Network Watcher region may be different
+                        networkWatcherRG = await azure.ResourceGroups
+                            .Define("NetworkWatcherRG")
+                            .WithRegion(Region.USWestCentral)
+                            .CreateAsync();
+                    }
+
+                    string networkWatcherName = "NetworkWatcher_" + region.Name.ToString().ToLower();
+                    networkWatcher = await azure.NetworkWatchers.Define(networkWatcherName).WithRegion(region).WithExistingResourceGroup(networkWatcherRG).CreateAsync();
+                }
+                catch (Exception ex)
+                {
+                    log?.Error($"Unable to create ResourceGroup or Network Watcher: {ex}. Exiting.");
+                    throw;
+                }
+            }
+
+            return networkWatcher;
+        }
+
+        private static void InstallNetworkWatcherExtension(IVirtualMachine vm, TraceWriter log = null)
+        {
+            IVirtualMachineExtension extension = vm.ListExtensions().First(x => x.Value.PublisherName == "Microsoft.Azure.NetworkWatcher").Value;
+            if (extension == null)
+            {
+                vm.Update()
+                    .DefineNewExtension("packetcapture")
+                    .WithPublisher("Microsoft.Azure.NetworkWatcher")
+                    .WithType("NetworkWatcherAgentWindows") // TODO: determine OS family, can be NetworkWatcherAgentLinux
+                    .WithVersion("1.4")
+                    .Attach();
+
+                log?.Info("Installed Extension on " + vm.Name);
+            }
         }
     }
 }
